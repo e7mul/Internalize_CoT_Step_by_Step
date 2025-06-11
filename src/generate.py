@@ -2,7 +2,7 @@ import math
 import time
 import torch
 from torch.utils.data import DataLoader
-from transformers import AdamW
+# from transformers import AdamW
 import argparse
 import os
 import sys
@@ -21,11 +21,12 @@ logging.disable(logging.WARNING)
 
 
 @torch.no_grad()
-def evaluate(dataloader, tokenizer, device, ctx, model, max_new_tokens):
+def evaluate(dataloader, tokenizer, device, ctx, model, max_new_tokens, rpath):
     model.eval()
     total_instances = 0
     total_correct = 0
     total_time = 0
+    correct_at_id = {i: 0 for i in range(10)}
     for batch in tqdm.tqdm(dataloader):
         input_ids_all = batch['input_ids_all'].to(device)
         labels = batch['labels_all'].to(device)
@@ -46,6 +47,7 @@ def evaluate(dataloader, tokenizer, device, ctx, model, max_new_tokens):
         end_time = time.time()
         total_time += end_time - start_time
         # Evaluate
+        
         for i, (input_ids_all_i, beam_output_i) in enumerate(zip(input_ids_all, beam_output)):
             sep_position = sep_positions[i].item()
             tgt = input_ids_all_i[sep_position+1:]
@@ -53,12 +55,28 @@ def evaluate(dataloader, tokenizer, device, ctx, model, max_new_tokens):
             ans = extract_answer(tgt_text)
             pred_text = tokenizer.decode(beam_output_i[0][sep_position+1:], skip_special_tokens=True)
             pred_ans = extract_answer(pred_text)
+
+            pred_ans = "".join(pred_ans.removeprefix("####").split(" "))
+            ans = "".join(ans.removeprefix("####").split(" "))
             if ans == pred_ans:
                 total_correct += 1
-            print (f'Input: {tokenizer.decode(input_ids_all_i[:sep_position], skip_special_tokens=True)}')
-            print (f'Target: {tgt_text}')
-            print (f'Predicted: {pred_text}')
-            print ('')
+            for i in range(10):
+                if ans[i] == pred_ans[i]:
+                    correct_at_id[i] += 1
+            # print (f'Input: {tokenizer.decode(input_ids_all_i[:sep_position], skip_special_tokens=True)}')
+            # print (f'Target: {tgt_text}')
+            # print (f'Predicted: {pred_text}')
+            # print ('')
+    print(correct_at_id)
+    import matplotlib.pyplot as plt
+    plt.bar(list(correct_at_id.keys()), [x/total_instances for x in list(correct_at_id.values())])
+    plt.xlabel("ID")
+    plt.ylabel("Accuracy")
+    plt.title("Accuracy at token")
+    plt.ylim(0, 1)
+    plt.savefig(os.path.join(rpath, "correct_at_id.png"))
+    plt.close()
+
     accuracy = total_correct / total_instances
     throughput = total_instances / total_time
     return accuracy, throughput
@@ -66,9 +84,9 @@ def evaluate(dataloader, tokenizer, device, ctx, model, max_new_tokens):
 
 def main():
     parser = argparse.ArgumentParser()
-    parser.add_argument('--from_pretrained', type=str, default=None)
+    parser.add_argument('--rpath', type=str, default=None)
     parser.add_argument('--test_path', type=str, required=True)
-    parser.add_argument('--max_new_tokens', type=int, default=800)
+    parser.add_argument('--max_new_tokens', type=int, default=14)
     parser.add_argument('--batch_size', type=int, default=1)
     parser.add_argument('--truncation', type=int, default=-1)
     parser.add_argument('--bf16', action='store_true')
@@ -87,8 +105,8 @@ def main():
     print (ptdtype, dtype, device)
 
     # Load model
-    print (f'Loading from {args.from_pretrained}')
-    model = ImplicitModel.from_pretrained(args.from_pretrained).to(device).to(ptdtype)
+    print (f'Loading from {args.rpath}')
+    model = ImplicitModel.from_pretrained(args.rpath).to(device).to(ptdtype)
     model = model.to(device).to(ptdtype)
     model.eval()
     tokenizer = model.tokenizer
@@ -98,7 +116,7 @@ def main():
     test_dataset = CoTDataset(tokenizer, args.test_path, args.truncation)
     test_dataloader = DataLoader(test_dataset, batch_size=args.batch_size, collate_fn=collate_fn, shuffle=False)
 
-    accuracy, throughput = evaluate(test_dataloader, tokenizer, device, ctx, model, args.max_new_tokens)
+    accuracy, throughput = evaluate(test_dataloader, tokenizer, device, ctx, model, args.max_new_tokens, args.rpath)
     print (f"Test Accuracy: {accuracy}. Throughput: {throughput}")
 
 if __name__ == "__main__":

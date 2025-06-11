@@ -31,6 +31,37 @@ class ImplicitModel(nn.Module):
         outputs = self.forward(input_ids=input_ids, position_ids=position_ids, output_attentions=output_attentions)
         logits = outputs.logits
 
+        def get_last_sep_position(input_ids):
+            """
+            Get the index of the second-to-last True value in each row.
+            Returns -1 for rows with fewer than 2 True values.
+            """
+            # Get all True positions
+            row_indices, col_indices = input_ids.eq(self.tokenizer.eos_token_id).nonzero(as_tuple=True)
+            
+            results = []
+            # Group by row
+            for row in range(input_ids.shape[0]):
+                # Get all True positions for this row
+                row_mask = (row_indices == row)
+                if row_mask.sum() >= 2:
+                    # Get column indices for this row and take second-to-last
+                    row_cols = col_indices[row_mask]
+                    results.append(row_cols[-2])
+                else:
+                    results.append(-1)
+            return torch.tensor(results)
+
+        sep_positions = get_last_sep_position(input_ids)
+        assert len(sep_positions.unique()) == 1, 'sep_positions has more than one unique value'
+        sep_position = sep_positions[0]
+        ans_preds = logits[..., sep_position:-1, :].argmax(-1)
+        ans_labels = labels[..., sep_position+1:]
+        correct_ans_tokens = (ans_preds == ans_labels).sum()
+        total_ans_tokens = (ans_labels != -100).sum()
+        correct_per_row = (ans_preds == ans_labels).sum(-1)
+        total_correct_answers = (correct_per_row == ans_labels.shape[-1]).sum()
+    
         labels_pred = logits.argmax(-1)
         mask = labels[...,1:].ge(0)
         correct_tokens = ((labels_pred[...,:-1] == labels[...,1:]) * mask).sum()
@@ -47,6 +78,9 @@ class ImplicitModel(nn.Module):
         outputs.total_correct = correct_tokens
         outputs.total_loss = loss * total_tokens
         outputs.total_tokens = total_tokens
+        outputs.total_correct_answers = total_correct_answers
+        outputs.correct_ans_tokens = correct_ans_tokens
+        outputs.total_ans_tokens = total_ans_tokens
         return outputs
 
     def generate(self, input_ids, max_new_tokens=512, num_beams=1, stop_on_two_eos=True, position_ids=None):
