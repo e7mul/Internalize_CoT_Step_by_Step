@@ -5,37 +5,85 @@ import torch
 from torch.utils.data import Dataset
 from torch.nn.utils.rnn import pad_sequence
 
+
+def get_dataloader(args, path, tokenizer, world_size, rank):
+    collate_fn = CoTDataCollator(tokenizer)
+    train_dataset = CoTDataset(
+        tokenizer,
+        path,
+        args.truncation,
+        max_size=args.max_size,
+        remove_cot=args.remove_cot,
+        random_cot=args.random_cot,
+        keep_k_target=args.keep_k_target,
+    )
+
+    sampler = (
+        DistributedSampler(
+            train_dataset, num_replicas=world_size, rank=rank, shuffle=True
+        )
+        if args.distributed and world_size > 1
+        else None
+    )
+
+    loader = DataLoader(
+        train_dataset,
+        batch_size=args.batch_size,
+        collate_fn=collate_fn,
+        sampler=sampler,
+        shuffle=(sampler is None),
+    )
+    return loader
+
+
 def extract_answer(text):
-    split_pattern = '####'
+    split_pattern = "####"
     if split_pattern not in text:
-        return text.strip().replace(',', '')
+        return text.strip().replace(",", "")
     else:
-        _, ans = text.strip().split('####', 1)
-        ans = '####' + ans
-        ans = ans.strip().replace(',', '')
+        _, ans = text.strip().split("####", 1)
+        ans = "####" + ans
+        ans = ans.strip().replace(",", "")
         return ans
 
+
 def extract_cot(text):
-    split_pattern = '####'
+    split_pattern = "####"
     if split_pattern not in text:
         return None
     else:
-        cot, _ = text.strip().split('####', 1)
+        cot, _ = text.strip().split("####", 1)
         cot = cot.strip()
         return cot
 
+
 class CoTDataset(Dataset):
-    def __init__(self, tokenizer, file_path, max_length=-1, max_size=-1, remove_cot=False, random_cot=False, keep_k_target=0):
+    def __init__(
+        self,
+        tokenizer,
+        file_path,
+        max_length=-1,
+        max_size=-1,
+        remove_cot=False,
+        random_cot=False,
+        keep_k_target=0,
+    ):
         assert os.path.isfile(file_path), f"Input file path {file_path} not found"
-        print (f'Creating features from dataset file at {file_path}')
+        print(f"Creating features from dataset file at {file_path}")
         eos_tok = tokenizer.eos_token
 
-
         with open(file_path, encoding="utf-8") as f:
-            lines = [line.strip().split('||') for line in f.readlines() if (len(line.strip()) > 0 and not line.strip().isspace()
-                                                                             and len(line.strip().split('||')) ==2 )]
+            lines = [
+                line.strip().split("||")
+                for line in f.readlines()
+                if (
+                    len(line.strip()) > 0
+                    and not line.strip().isspace()
+                    and len(line.strip().split("||")) == 2
+                )
+            ]
         if max_size > 0:
-            print (f'truncated to {max_size}')
+            print(f"truncated to {max_size}")
             lines = lines[:max_size]
         src_lines, tgt_lines = list(zip(*lines))
         src_lines = list(src_lines)
@@ -47,26 +95,43 @@ class CoTDataset(Dataset):
                 cot = extract_cot(tgt)
                 example_cots.append(cot)
 
-        start_index = 5 # this trims the special tokens from the start of the answer
+        start_index = 5  # this trims the special tokens from the start of the answer
         # Create a list of all examples
         self.examples_all = []
         for src, tgt in zip(src_lines, tgt_lines):
             ans = extract_answer(tgt)
             if keep_k_target > 0:
-                ans = ans[:start_index + 2*keep_k_target]
+                ans = ans[: start_index + 2 * keep_k_target]
             if remove_cot:
-                sent = ' {} {} '.format(src, eos_tok) + ans + ' {}'.format(eos_tok)
+                sent = " {} {} ".format(src, eos_tok) + ans + " {}".format(eos_tok)
             elif random_cot:
                 import random
+
                 cot = example_cots.pop(random.randint(0, len(example_cots) - 1))
-                sent = ' {} {} '.format(src, eos_tok) + cot + ' {} '.format(eos_tok) + ans + ' {}'.format(eos_tok)
+                sent = (
+                    " {} {} ".format(src, eos_tok)
+                    + cot
+                    + " {} ".format(eos_tok)
+                    + ans
+                    + " {}".format(eos_tok)
+                )
             else:
                 cot = extract_cot(tgt)
-                sent = ' {} {} '.format(src, eos_tok) + cot + ' {} '.format(eos_tok) + ans + ' {}'.format(eos_tok)
-
+                sent = (
+                    " {} {} ".format(src, eos_tok)
+                    + cot
+                    + " {} ".format(eos_tok)
+                    + ans
+                    + " {}".format(eos_tok)
+                )
 
             if max_length > 0:
-                batch_encoding_all = tokenizer([sent], add_special_tokens=True, truncation=True, max_length=max_length)
+                batch_encoding_all = tokenizer(
+                    [sent],
+                    add_special_tokens=True,
+                    truncation=True,
+                    max_length=max_length,
+                )
             else:
                 batch_encoding_all = tokenizer([sent], add_special_tokens=True)
             self.examples_all.append(batch_encoding_all["input_ids"][0])
@@ -82,9 +147,11 @@ class CoTDataset(Dataset):
         sep_idx = labels.index(self.separator) + 1
         labels[:sep_idx] = [-100] * sep_idx
         return (
-                torch.tensor(input_ids, dtype=torch.long),
-                torch.tensor(labels, dtype=torch.long),
-                )
+            torch.tensor(input_ids, dtype=torch.long),
+            torch.tensor(labels, dtype=torch.long),
+        )
+
+
 @dataclass
 class CoTDataCollator:
     """
@@ -92,6 +159,7 @@ class CoTDataCollator:
     - collates batches of tensors, honoring their tokenizer's pad_token
     - preprocesses batches for masked language modeling
     """
+
     def __init__(self, tokenizer):
         self.tokenizer = tokenizer
 
@@ -100,7 +168,7 @@ class CoTDataCollator:
         input_ids_all = self._tensorize_batch(input_ids_all)
         input_ids_all[input_ids_all.lt(0)] = self.tokenizer.eos_token_id
         labels_all = self._tensorize_batch(labels_all)
-        return {'input_ids_all': input_ids_all, 'labels_all': labels_all}
+        return {"input_ids_all": input_ids_all, "labels_all": labels_all}
 
     def _tensorize_batch(self, examples):
         if isinstance(examples[0], (list, tuple)):

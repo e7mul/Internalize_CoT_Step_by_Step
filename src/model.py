@@ -3,39 +3,102 @@ import torch
 import torch.nn as nn
 import math
 from torch.nn import CrossEntropyLoss
-from transformers import AutoModelForCausalLM, AutoTokenizer, StoppingCriteriaList, GenerationConfig, LogitsProcessorList
+from transformers import (
+    AutoModelForCausalLM,
+    AutoTokenizer,
+    StoppingCriteriaList,
+    GenerationConfig,
+    LogitsProcessorList,
+)
 
 from configuration_model import ImplicitModelConfig
 from utils import DoubleEOSStoppingCriteria, DoubleEOSLogitsProcessor
+
+
+def save_model_and_optimizer(model, optimizer, args, rank, ckpt_idx):
+    if rank == 0:
+        print("Saving model and optimizer...")
+        # Save the model (unwrap DDP if necessary)
+        os.makedirs(args.save_model, exist_ok=True)
+        model_to_save = get_model(model)
+        model_to_save.save_pretrained(
+            os.path.join(args.save_model, f"checkpoint_{ckpt_idx}")
+        )
+        optimizer_state_dict = optimizer.state_dict()
+        torch.save(
+            optimizer_state_dict,
+            os.path.join(args.save_model, f"optimizer_{ckpt_idx}.pt"),
+        )
+        print(f"Saved model and optimizer to {args.save_model}/checkpoint_{ckpt_idx}")
+
+
+def get_model(args, device, ptdtype, rank):
+    # Create model with temperature scaling options
+    if args.from_pretrained is None:
+        config = ImplicitModelConfig(
+            base_model=args.model,
+            use_temperature_scaling=args.use_temperature_scaling,
+            temperature_init_value=args.temperature_init_value,
+            temperature_learnable=args.temperature_learnable,
+        )
+        model = ImplicitModel(config).to(device).to(ptdtype)
+    else:
+        if rank == 0:
+            print(f"Loading from {args.from_pretrained}")
+        override_config = {
+            "use_temperature_scaling": args.use_temperature_scaling,
+            "temperature_init_value": args.temperature_init_value,
+            "temperature_learnable": args.temperature_learnable,
+        }
+        model = (
+            ImplicitModel.from_pretrained(
+                args.from_pretrained, override_config=override_config
+            )
+            .to(device)
+            .to(ptdtype)
+        )
+
+    model = model.to(device).to(ptdtype)
+    tokenizer = model.tokenizer
+
+    if args.reinitialize_weights:
+        if rank == 0:
+            print("reinitializing weights")
+        underlying_model = get_model(model)
+        underlying_model.base_model.apply(underlying_model.base_model._init_weights)
+
+    return model, tokenizer
 
 
 class ImplicitModel(nn.Module):
     def __init__(self, config, reinitialize_weights=False):
         super().__init__()
         self.config = config
-        
+
         # Choose between standard and temperature-scaled model
         if config.use_temperature_scaling:
             from custom_gpt2 import TemperatureScaledGPT2LMHeadModel
+
             self.base_model = TemperatureScaledGPT2LMHeadModel.from_pretrained(
                 config.base_model,
                 temperature_init_value=config.temperature_init_value,
                 temperature_learnable=config.temperature_learnable,
-                trust_remote_code=True
+                trust_remote_code=True,
             )
         else:
             self.base_model = AutoModelForCausalLM.from_pretrained(
-                config.base_model, 
-                trust_remote_code=True
+                config.base_model, trust_remote_code=True
             )
-            
+
         if reinitialize_weights:
-            print ('Reinitializing model weights!')
+            print("Reinitializing model weights!")
             self.base_model.apply(self.base_model._init_weights)
         self.tokenizer = AutoTokenizer.from_pretrained(config.tokenizer_name)
 
     def forward(self, input_ids, output_attentions=False, **kwargs):
-        outputs = self.base_model.forward(input_ids=input_ids, output_attentions=output_attentions, **kwargs)
+        outputs = self.base_model.forward(
+            input_ids=input_ids, output_attentions=output_attentions, **kwargs
+        )
         return outputs
 
     def compute_loss(self, input_ids, labels, output_attentions=False):
@@ -48,13 +111,15 @@ class ImplicitModel(nn.Module):
             Returns -1 for rows with fewer than 2 True values.
             """
             # Get all True positions
-            row_indices, col_indices = input_ids.eq(self.tokenizer.eos_token_id).nonzero(as_tuple=True)
-            
+            row_indices, col_indices = input_ids.eq(
+                self.tokenizer.eos_token_id
+            ).nonzero(as_tuple=True)
+
             results = []
             # Group by row
             for row in range(input_ids.shape[0]):
                 # Get all True positions for this row
-                row_mask = (row_indices == row)
+                row_mask = row_indices == row
                 if row_mask.sum() >= 2:
                     # Get column indices for this row and take second-to-last
                     row_cols = col_indices[row_mask]
@@ -64,25 +129,29 @@ class ImplicitModel(nn.Module):
             return torch.tensor(results)
 
         sep_positions = get_last_sep_position(input_ids)
-        assert len(sep_positions.unique()) == 1, 'sep_positions has more than one unique value'
+        assert (
+            len(sep_positions.unique()) == 1
+        ), "sep_positions has more than one unique value"
         sep_position = sep_positions[0]
         ans_preds = logits[..., sep_position:-1, :].argmax(-1)
-        ans_labels = labels[..., sep_position+1:]
+        ans_labels = labels[..., sep_position + 1 :]
         correct_ans_tokens = (ans_preds == ans_labels).sum()
         total_ans_tokens = (ans_labels != -100).sum()
         correct_per_row = (ans_preds == ans_labels).sum(-1)
         total_correct_answers = (correct_per_row == ans_labels.shape[-1]).sum()
-    
+
         labels_pred = logits.argmax(-1)
-        mask = labels[...,1:].ge(0)
-        correct_tokens = ((labels_pred[...,:-1] == labels[...,1:]) * mask).sum()
+        mask = labels[..., 1:].ge(0)
+        correct_tokens = ((labels_pred[..., :-1] == labels[..., 1:]) * mask).sum()
         total_tokens = mask.sum()
         token_accuracy = correct_tokens / total_tokens
 
         shift_logits = logits[..., :-1, :].contiguous()
         shift_labels = labels[..., 1:].contiguous()
         loss_fct = CrossEntropyLoss()
-        loss = loss_fct(shift_logits.view(-1, shift_logits.size(-1)), shift_labels.view(-1))
+        loss = loss_fct(
+            shift_logits.view(-1, shift_logits.size(-1)), shift_labels.view(-1)
+        )
 
         outputs.loss = loss
         outputs.token_accuracy = token_accuracy
@@ -94,17 +163,22 @@ class ImplicitModel(nn.Module):
         outputs.total_ans_tokens = total_ans_tokens
         return outputs
 
-    def generate(self, input_ids, max_new_tokens=512, num_beams=1, stop_on_two_eos=True):
+    def generate(
+        self, input_ids, max_new_tokens=512, num_beams=1, stop_on_two_eos=True
+    ):
         # Since there's one eos after CoT and another after final answer, we need to wait for two eos
         generation_config = GenerationConfig.from_model_config(self.base_model.config)
         if stop_on_two_eos:
             generation_config.eos_token_id = -1
-            logits_processor = LogitsProcessorList([DoubleEOSLogitsProcessor(self.tokenizer.eos_token_id)])
-            stopping_criteria = StoppingCriteriaList([DoubleEOSStoppingCriteria(self.tokenizer.eos_token_id)])
+            logits_processor = LogitsProcessorList(
+                [DoubleEOSLogitsProcessor(self.tokenizer.eos_token_id)]
+            )
+            stopping_criteria = StoppingCriteriaList(
+                [DoubleEOSStoppingCriteria(self.tokenizer.eos_token_id)]
+            )
         else:
             logits_processor = None
             stopping_criteria = None
-        
 
         beam_output = self.base_model.generate(
             input_ids=input_ids,
@@ -122,14 +196,14 @@ class ImplicitModel(nn.Module):
 
     def get_temperature_info(self):
         """Get temperature information if using temperature scaling."""
-        if hasattr(self.base_model, 'get_all_temperature_info'):
+        if hasattr(self.base_model, "get_all_temperature_info"):
             return self.base_model.get_all_temperature_info()
         else:
             return None
 
     def set_temperature_learning(self, learnable):
         """Enable/disable temperature learning."""
-        if hasattr(self.base_model, 'set_temperature_learning'):
+        if hasattr(self.base_model, "set_temperature_learning"):
             self.base_model.set_temperature_learning(learnable)
         else:
             print("Temperature scaling not enabled for this model")
@@ -140,7 +214,7 @@ class ImplicitModel(nn.Module):
         if override_config is not None:
             config.update(override_config)
         model = ImplicitModel(config)
-        state_dict = torch.load(os.path.join(pretrained_path, 'state_dict.bin'))
+        state_dict = torch.load(os.path.join(pretrained_path, "state_dict.bin"))
         try:
             model.load_state_dict(state_dict, strict=True)
         except RuntimeError as e:
@@ -151,15 +225,19 @@ class ImplicitModel(nn.Module):
             else:
                 raise e
 
-        if override_config is not None and override_config['use_temperature_scaling']:
+        if override_config is not None and override_config["use_temperature_scaling"]:
             for name, module in model.named_modules():
-                if hasattr(module, 'temperature_logits'):
-                    module.temperature_logits.data = torch.full((module.num_heads,), math.log(override_config['temperature_init_value']), dtype=torch.float32)
+                if hasattr(module, "temperature_logits"):
+                    module.temperature_logits.data = torch.full(
+                        (module.num_heads,),
+                        math.log(override_config["temperature_init_value"]),
+                        dtype=torch.float32,
+                    )
 
         return model
 
     def save_pretrained(self, save_directory):
-        print (f'Saving to {save_directory}')
+        print(f"Saving to {save_directory}")
         self.config.save_pretrained(save_directory)
         state_dict = self.state_dict()
-        torch.save(state_dict, os.path.join(save_directory, 'state_dict.bin'))
+        torch.save(state_dict, os.path.join(save_directory, "state_dict.bin"))
