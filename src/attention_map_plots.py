@@ -28,17 +28,19 @@ if __name__ == "__main__":
     parser.add_argument("--max_size", type=int, default=1000, help="Maximum size of the dataset")
     args = parser.parse_args()
 
-    epochs = [-1] + [int(epoch) for epoch in args.epochs.split(",")]
+    # epochs = [-1] + [int(epoch) for epoch in args.epochs.split(",")]
+    epochs = [int(epoch) for epoch in args.epochs.split(",")]
     num_heads = 12
     head_dim = 64
 
     attention_maps = collect_attention_maps(args)
+    
     for epoch in epochs:
         print(f"Plotting epoch {epoch}")
         for layer, attn_map in attention_maps[epoch].items():
             rand_samples = np.random.randint(0, len(attn_map), size=args.num_samples_to_plot)
             attention_map = attn_map[rand_samples]
-            fig, axs = plt.subplots(num_heads, 2, figsize=(10, 30), gridspec_kw={'wspace': 1})
+            fig, axs = plt.subplots(num_heads, 2, figsize=(10, 30), gridspec_kw={'wspace': 1, 'hspace': 0.5})
             attn_probs = compute_attn_probs(attention_map, head_dim)
             entropy_values = compute_entropy(attn_probs)
             ranks_pre = torch.linalg.matrix_rank(attention_map)
@@ -47,7 +49,8 @@ if __name__ == "__main__":
                 for head in range(num_heads):
                     axs[head, 0].imshow(attention_map[sample, head])
                     axs[head, 1].imshow(attn_probs[sample, head])
-                    axs[head, 0].set_title("Rank: " + str(ranks_pre[sample, head].item()))
+                    axs[head, 0].set_title("Rank: " + str(ranks_pre[sample, head].item()) + "\n Norm: " + str(round(torch.norm(attention_map[sample, head]).item(), 2)))
                     axs[head, 1].set_title("Rank: " + str(ranks_post[sample, head].item()) + "\n entropy: " + str(round(entropy_values[sample, head].item(), 2)))
             os.makedirs(f"{args.rpath}/attentions/Epoch_{epoch}/Layer_{layer}", exist_ok=True)
             plt.savefig(f"{args.rpath}/attentions/Epoch_{epoch}/Layer_{layer}/Sample_{rand_samples}.png")
+            plt.close()

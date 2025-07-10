@@ -25,7 +25,7 @@ def extract_cot(text):
         return cot
 
 class CoTDataset(Dataset):
-    def __init__(self, tokenizer, file_path, max_length=-1, max_size=-1, remove_cot=False, random_cot=False):
+    def __init__(self, tokenizer, file_path, max_length=-1, max_size=-1, remove_cot=False, random_cot=False, keep_k_target=0):
         assert os.path.isfile(file_path), f"Input file path {file_path} not found"
         print (f'Creating features from dataset file at {file_path}')
         eos_tok = tokenizer.eos_token
@@ -47,10 +47,13 @@ class CoTDataset(Dataset):
                 cot = extract_cot(tgt)
                 example_cots.append(cot)
 
+        start_index = 5 # this trims the special tokens from the start of the answer
         # Create a list of all examples
         self.examples_all = []
         for src, tgt in zip(src_lines, tgt_lines):
             ans = extract_answer(tgt)
+            if keep_k_target > 0:
+                ans = ans[:start_index + 2*keep_k_target]
             if remove_cot:
                 sent = ' {} {} '.format(src, eos_tok) + ans + ' {}'.format(eos_tok)
             elif random_cot:
@@ -60,6 +63,7 @@ class CoTDataset(Dataset):
             else:
                 cot = extract_cot(tgt)
                 sent = ' {} {} '.format(src, eos_tok) + cot + ' {} '.format(eos_tok) + ans + ' {}'.format(eos_tok)
+
 
             if max_length > 0:
                 batch_encoding_all = tokenizer([sent], add_special_tokens=True, truncation=True, max_length=max_length)

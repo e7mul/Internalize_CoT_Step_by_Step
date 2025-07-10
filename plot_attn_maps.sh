@@ -3,10 +3,9 @@
 # Example distributed analysis script
 # This shows how to run attention analysis across multiple GPUs
 
-export EXPERIMENT_PATH="results/5_by_5_mult/gpt2_20250608_114605_remove_cot"
+export EXPERIMENT_PATH="results/5_by_5_mult/gpt2_20250707_195922"
 export LAYERS="0,1,2,3,4,5,6,7,8,9,10,11"  # Analyze layers 0-5
-export EPOCHS="0,1,2,3,4,5,6,7,8,9,10,11,12,13,14,15,16,17,18,19,20,21,22,23,24,25,26,27,28,29,30,31,32,33,34,35,36,37,38,39"
-
+export EPOCHS="0,1,2,3,4,5,6,7,8,9" #,11,12" #,13,14,15,16,17,18,19,20,21,22,23,24,25,26,27,28,29"
 
 echo "Running distributed attention analysis..."
 echo "Experiment path: $EXPERIMENT_PATH"

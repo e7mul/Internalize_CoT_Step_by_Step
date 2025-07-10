@@ -1,4 +1,5 @@
 import os
+import sys
 import torch
 from torch.utils.data import DataLoader
 from typing import Dict, List
@@ -8,6 +9,9 @@ from utils import load_experiment_config, count_checkpoints
 from model import ImplicitModel
 from data import CoTDataset, CoTDataCollator
 from configuration_model import ImplicitModelConfig
+
+sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+from seq_vcr.model_wrapper import SeqVCRImplicitModel, SeqVCRConfig
 
 
 class CollectAttentionMaps:
@@ -53,6 +57,11 @@ class CollectAttentionMaps:
                 key = key.view(bsz, seq_len, num_heads, head_dim).transpose(1, 2)
                 
                 attn_weights = torch.matmul(query, key.transpose(-1, -2))
+                if hasattr(module, 'temperature_logits'):
+                    print("using learnable temperature")
+                    attn_weights = attn_weights * module.temperature_logits.view(1, num_heads, 1, 1)
+                else:
+                    print("using fixed temperature")
                 attention_maps[layer_idx].append(attn_weights.detach().cpu())
                 return True
             except Exception as e:
@@ -122,8 +131,30 @@ def collect_attention_maps(args):
         dataset = CoTDataset(config.tokenizer, config.val_dataset, config.max_length, args.max_size, config.remove_cot, config.random_cot)
 
     # Create base model
-    model_config = ImplicitModelConfig(base_model=config.model_name)
+    model_config = ImplicitModelConfig(
+        base_model=config.model_name,
+        use_temperature_scaling=config.use_temperature_scaling,
+        temperature_init_value=config.temperature_init_value,
+        temperature_learnable=config.temperature_learnable
+    )
     model = ImplicitModel(model_config).to(device)
+
+    # Wrap model with Seq-VCR if enabled
+    if (config.enable_seq_vcr or config.enable_pause_tokens):
+        print(f"Enabling Seq-VCR: regularization={config.enable_seq_vcr}, pause_tokens={config.enable_pause_tokens}")
+        print(f"Seq-VCR params: lambda_var={config.lambda_var}, lambda_cov={config.lambda_cov}, num_pause_tokens={config.num_pause_tokens}")
+        seq_vcr_config = SeqVCRConfig(
+            enable_seq_vcr=config.enable_seq_vcr,
+            enable_pause_tokens=config.enable_pause_tokens,
+            lambda_var=config.lambda_var,
+            lambda_cov=config.lambda_cov,
+            num_pause_tokens=config.num_pause_tokens,
+            projection_dim=config.projection_dim,
+            epsilon=config.seq_vcr_epsilon
+        )
+        model = SeqVCRImplicitModel(model, seq_vcr_config)
+        model = model.to(device)
+
 
     print(model)
 
@@ -139,9 +170,15 @@ def collect_attention_maps(args):
         # Load checkpoint
         state_dict = torch.load(ckpt_path, map_location=device)
         model_to_load = model.module if hasattr(model, 'module') else model
-        model_to_load.load_state_dict(state_dict, strict=True)
+
+        if config.enable_seq_vcr or config.enable_pause_tokens:
+            model_to_load.load_state_dict(state_dict, strict=False) # we set to False, because we don't want to load the Seq-VCR state dict
+        else:
+            model_to_load.load_state_dict(state_dict, strict=True)
 
         # Run analysis
+
+        model.pause_processor = None # we don't want to collect attention maps for the pause tokens but we need to change the tokenizer for correct loading
         
         attention_maps = CollectAttentionMaps(model, config.tokenizer, dataset, device, args.batch_size, args.max_samples).collect_attention_maps(layers_to_collect)
         results[epoch] = attention_maps

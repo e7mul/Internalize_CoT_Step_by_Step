@@ -18,7 +18,9 @@ class Analysis:
         results_dict = {
             "rank_metrics": self.compute_rank(self.attention_maps), 
             "entropy_metrics": self.compute_entropy(self.attention_maps), 
-            "sink_rate_metrics": self.compute_sink_rate(self.attention_maps)}
+            "sink_rate_metrics": self.compute_sink_rate(self.attention_maps),
+            "frob_norm_metrics": self.compute_frob_norm(self.attention_maps)
+            }
         return results_dict
 
 
@@ -80,6 +82,29 @@ class Analysis:
         return entropy_metrics
 
 
+    def compute_frob_norm(self, attention_maps: Dict) -> Dict:
+        """Compute frobenius norm metrics for attention maps per head (both pre and post softmax)"""
+        frob_norm_metrics = {}
+        for layer_idx, attn_maps in attention_maps.items():
+            batch_size, num_heads, seq_len, _ = attn_maps.shape
+            try:
+                frob_norms = torch.linalg.matrix_norm(attn_maps, ord=2, dim=(-2, -1))
+                avg_frob_norms_per_head = frob_norms.mean(dim=0)
+                all_frob_norms = frob_norms.view(batch_size*num_heads)
+            except Exception as e:
+                print(f"Error computing norm for layer {layer_idx}: {e}")
+                avg_frob_norms_per_head = torch.zeros(num_heads)
+                all_frob_norms = torch.zeros(batch_size*num_heads)
+
+            frob_norm_metrics[layer_idx] = {
+                'frob_norms_per_head': avg_frob_norms_per_head,
+                'avg_frob_norm': torch.mean(all_frob_norms).item(),
+                'std_frob_norm': torch.std(all_frob_norms).item(),
+            }
+
+        return frob_norm_metrics
+
+
     def compute_sink_rate(self, attention_maps: Dict) -> Dict:
         """Compute sink rate for attention maps"""
         sink_rate_metrics = {}
@@ -122,7 +147,7 @@ if __name__ == "__main__":
     
     print(list(attn_maps.keys()))
     results = {}
-    for epoch in args.epochs.split(","):
+    for epoch in [-1] + args.epochs.split(","):
         analysis = Analysis(attn_maps[int(epoch)])
         results[f"epoch_{epoch}"] = analysis.analyze()
 

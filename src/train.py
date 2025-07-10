@@ -20,6 +20,15 @@ from configuration_model import ImplicitModelConfig
 from data import CoTDataset, CoTDataCollator, extract_answer
 from utils import get_sep_position, MetricTracker, setup_distributed, cleanup_distributed, get_model
 
+# Add path to import Seq-VCR modules
+sys.path.append(os.path.join(os.path.dirname(__file__), '..'))
+try:
+    from seq_vcr import SeqVCRImplicitModel, SeqVCRConfig
+    SEQ_VCR_AVAILABLE = True
+except ImportError:
+    print("Warning: Seq-VCR modules not available. Seq-VCR features will be disabled.")
+    SEQ_VCR_AVAILABLE = False
+
 
 torch.backends.cuda.matmul.allow_tf32 = True
 torch.backends.cudnn.allow_tf32 = True
@@ -27,14 +36,13 @@ logging.disable(logging.WARNING)
 
 
 @torch.no_grad()
-def evaluate(dataloader, tokenizer, device, ctx, model, keep_position=False, rank=0, world_size=1):
+def evaluate(dataloader, tokenizer, device, ctx, model, rank=0, world_size=1):
     model.eval()
     total_instances = 0
     total_tokens = 0
     total_correct_tokens = 0
     total_correct_answers = 0
     total_loss = 0
-    position_ids_all = None
     total_correct_ans_tokens = 0
     total_ans_tokens = 0
     
@@ -47,9 +55,7 @@ def evaluate(dataloader, tokenizer, device, ctx, model, keep_position=False, ran
         batch_size = input_ids.shape[0]
 
         with ctx:
-            if keep_position:
-                position_ids_all = position_ids_all[:, :input_ids_all.shape[-1]]
-            outputs = get_model(model).compute_loss(input_ids=input_ids_all, labels=labels, position_ids=position_ids_all)
+            outputs = get_model(model).compute_loss(input_ids=input_ids_all, labels=labels)
 
         total_loss += outputs.total_loss.item()
         total_correct_tokens += outputs.total_correct.item()
@@ -103,13 +109,38 @@ def main():
     parser.set_defaults(bf16=False)
     parser.add_argument('--reset_optimizer', action='store_true')
     parser.set_defaults(reset_optimizer=False)
-    parser.add_argument('--keep_position', action='store_true')
-    parser.set_defaults(keep_position=False)
     parser.add_argument('--reinitialize_weights', action='store_true')
     parser.set_defaults(reinitialize_weights=False)
     # Distributed training arguments
     parser.add_argument('--distributed', action='store_true', help='Enable distributed training')
     parser.set_defaults(distributed=False)
+    
+    # Seq-VCR arguments
+    parser.add_argument('--enable_seq_vcr', action='store_true', help='Enable Seq-VCR regularization')
+    parser.add_argument('--enable_pause_tokens', action='store_true', help='Enable pause tokens')
+    parser.add_argument('--lambda_var', type=float, default=1.0, help='Variance regularization weight (lambda_1)')
+    parser.add_argument('--lambda_cov', type=float, default=0.004, help='Covariance regularization weight (lambda_2)')
+    parser.add_argument('--num_pause_tokens', type=int, default=2, help='Number of pause tokens to insert')
+    parser.add_argument('--projection_dim', type=int, default=2048, help='Projection dimension for regularization')
+    parser.add_argument('--seq_vcr_epsilon', type=float, default=0.001, help='Numerical stability constant for Seq-VCR')
+    parser.set_defaults(enable_seq_vcr=False)
+    parser.set_defaults(enable_pause_tokens=False)
+    
+    # Temperature scaling arguments
+    parser.add_argument('--use_temperature_scaling', action='store_true', 
+                       help='Use temperature-scaled attention')
+    parser.add_argument('--temperature_init_value', type=float, default=1.0,
+                       help='Initial value for temperature parameters (default: 1.0)')
+    parser.add_argument('--temperature_learnable', action='store_true',
+                       help='Make temperature parameters learnable')
+    parser.add_argument('--reset_temperature_value', type=float, default=0.0,
+                       help='Rest value for temperature parameters (default: 0.0)')
+    parser.set_defaults(use_temperature_scaling=False)
+    parser.set_defaults(temperature_learnable=False)
+
+    parser.add_argument('--keep_k_target', type=int, default=0,
+                       help='Keep k target tokens (default: 0)')
+    
     args = parser.parse_args()
 
 
@@ -153,17 +184,52 @@ def main():
     if rank == 0:
         print(ptdtype, dtype, device)
 
-    # Create model
+    # Create model with temperature scaling options
     if args.from_pretrained is None:
-        config = ImplicitModelConfig(base_model=args.model)
+        config = ImplicitModelConfig(
+            base_model=args.model,
+            use_temperature_scaling=args.use_temperature_scaling,
+            temperature_init_value=args.temperature_init_value,
+            temperature_learnable=args.temperature_learnable
+        )
         model = ImplicitModel(config).to(device).to(ptdtype)
     else:
         if rank == 0:
             print(f'Loading from {args.from_pretrained}')
-        model = ImplicitModel.from_pretrained(args.from_pretrained).to(device).to(ptdtype)
+        override_config = {
+            "use_temperature_scaling": args.use_temperature_scaling,
+            "temperature_init_value": args.temperature_init_value,
+            "temperature_learnable": args.temperature_learnable
+        }
+        model = ImplicitModel.from_pretrained(args.from_pretrained, override_config=override_config).to(device).to(ptdtype)
+
+
 
     model = model.to(device).to(ptdtype)
     tokenizer = model.tokenizer
+
+
+    # Wrap model with Seq-VCR if enabled
+    if (args.enable_seq_vcr or args.enable_pause_tokens) and SEQ_VCR_AVAILABLE:
+        if rank == 0:
+            print(f"Enabling Seq-VCR: regularization={args.enable_seq_vcr}, pause_tokens={args.enable_pause_tokens}")
+            print(f"Seq-VCR params: lambda_var={args.lambda_var}, lambda_cov={args.lambda_cov}, num_pause_tokens={args.num_pause_tokens}")
+        
+        seq_vcr_config = SeqVCRConfig(
+            enable_seq_vcr=args.enable_seq_vcr,
+            enable_pause_tokens=args.enable_pause_tokens,
+            lambda_var=args.lambda_var,
+            lambda_cov=args.lambda_cov,
+            num_pause_tokens=args.num_pause_tokens,
+            projection_dim=args.projection_dim,
+            epsilon=args.seq_vcr_epsilon
+        )
+        model = SeqVCRImplicitModel(model, seq_vcr_config)
+        model = model.to(device).to(ptdtype)
+        tokenizer = model.tokenizer  # Update tokenizer reference in case pause tokens were added
+    elif (args.enable_seq_vcr or args.enable_pause_tokens) and not SEQ_VCR_AVAILABLE:
+        if rank == 0:
+            print("Warning: Seq-VCR requested but not available. Continuing without Seq-VCR.")
 
     # Wrap model with DDP for distributed training
     if args.distributed and world_size > 1:
@@ -178,8 +244,8 @@ def main():
 
     # Load data
     collate_fn = CoTDataCollator(tokenizer)
-    train_dataset = CoTDataset(tokenizer, args.train_path, args.truncation, max_size=args.max_size, remove_cot=args.remove_cot, random_cot=args.random_cot)
-    val_dataset = CoTDataset(tokenizer, args.val_path, args.truncation, remove_cot=args.remove_cot, random_cot=False)
+    train_dataset = CoTDataset(tokenizer, args.train_path, args.truncation, max_size=args.max_size, remove_cot=args.remove_cot, random_cot=args.random_cot, keep_k_target=args.keep_k_target)
+    val_dataset = CoTDataset(tokenizer, args.val_path, args.truncation, remove_cot=args.remove_cot, random_cot=False, keep_k_target=args.keep_k_target)
     
     # Use DistributedSampler for distributed training
     train_sampler = DistributedSampler(train_dataset, num_replicas=world_size, rank=rank, shuffle=True) if args.distributed and world_size > 1 else None
@@ -220,7 +286,6 @@ def main():
 
     # Train
     step = 0
-    position_ids = None # TODO: what is that?
     best_val_accuracy = float('-inf')
 
     train_metric_tracker = MetricTracker()
@@ -233,7 +298,7 @@ def main():
     model_to_save.save_pretrained(os.path.join(args.save_model, f'checkpoint_-1'))
 
     if rank == 0:
-        logits_norm_tracker[-1] = get_logits_norm(model, train_dataloader, device, ctx, position_ids, rank)
+        logits_norm_tracker[-1] = get_logits_norm(model, train_dataloader, device, ctx, rank)
 
     for epoch in range(args.epochs):
         # Set epoch for DistributedSampler
@@ -245,13 +310,11 @@ def main():
         model.train()
         
         _norm = 0
-        for batch in tqdm.tqdm(train_dataloader, disable=(rank != 0)):
+        for batch in train_dataloader:
             input_ids = batch['input_ids_all'].to(device)
             labels = batch['labels_all'].to(device)
             with ctx: # this is the main part of the training loop
-                if args.keep_position:
-                    position_ids = position_ids[:, :input_ids.shape[-1]]
-                outputs = get_model(model).compute_loss(input_ids=input_ids, labels=labels, position_ids=position_ids)
+                outputs = get_model(model).compute_loss(input_ids=input_ids, labels=labels)
                 if rank == 0:
                     _norm += outputs.logits.norm(dim=-1).sum().item()
             loss = outputs.loss
@@ -264,20 +327,44 @@ def main():
             if step % 100 == 0 and rank == 0:
                 token_accuracy = outputs.token_accuracy.item()
                 ppl = loss.exp().item()
-                print(f"Step: {step}. PPL: {ppl}. Token Accuracy: {token_accuracy}")
+                reg_info = ""
+                if hasattr(get_model(model), 'get_regularization_info'):
+                    reg_data = get_model(model).get_regularization_info()
+                    if reg_data['enabled']:
+                        reg_info = f" Reg Loss: {reg_data['last_loss']:.4f}"
                 
+                # Add temperature information
+                temp_info = ""
+                if args.use_temperature_scaling:
+                    temp_data = get_model(model).get_temperature_info()
+                    if temp_data:
+                        mean_temps = [layer['mean_temp'] for layer in temp_data]
+                        avg_temp = sum(mean_temps) / len(mean_temps)
+                        temp_info = f" Avg Temp: {avg_temp:.3f}"
                 
-                # model_to_save = get_model(model)
-                # model_to_save.save_pretrained(os.path.join(args.save_model, f'checkpoint_{step}'))
-                
+                print(f"Step: {step}. PPL: {ppl}. Token Accuracy: {token_accuracy}{reg_info}{temp_info}")
+
+            # if rank == 0:
+            #     # Save the model (unwrap DDP if necessary)
+            #     model_to_save = get_model(model)
+            #     model_to_save.save_pretrained(os.path.join(args.save_model, f'checkpoint_{step}'))
+
             step += 1
+
+
+            # if rank == 0:
+            #     if step == 30:
+            #         cleanup_distributed()
+            #         return
+
+
 
         if rank == 0:
             train_metric_tracker.update(None, token_accuracy, ppl, epoch, None)
             logits_norm_tracker[epoch] = _norm
     
         accuracy, token_accuracy, ppl, ans_token_accuracy = evaluate(val_dataloader, tokenizer, device, ctx, model, 
-                                                keep_position=args.keep_position, rank=rank, world_size=world_size)
+                                                 rank=rank, world_size=world_size)
         if rank == 0:
             val_metric_tracker.update(accuracy, token_accuracy, ppl, epoch, ans_token_accuracy)
             print(f'Disable Offset Val. PPL: {ppl}; Accuracy: {accuracy}; Token Accuracy: {token_accuracy}; Ans Token Accuracy: {ans_token_accuracy}.')
@@ -288,7 +375,7 @@ def main():
             best_val_accuracy = accuracy
             if args.test_path:
                 accuracy, token_accuracy, ppl, ans_token_accuracy = evaluate(test_dataloader, tokenizer, device, ctx, model, 
-                                                        keep_position=args.keep_position, rank=rank, world_size=world_size)
+                                                        rank=rank, world_size=world_size)
                 if rank == 0:
                     test_metric_tracker.update(accuracy, token_accuracy, ppl, epoch, ans_token_accuracy)
                     print(f'Test. PPL: {ppl}; Accuracy: {accuracy}; Token Accuracy: {token_accuracy}; Ans Token Accuracy: {ans_token_accuracy}.')
@@ -303,23 +390,27 @@ def main():
                      open(os.path.join(args.save_model, 'test_metric_tracker.json'), 'w'))
             json.dump({"logits_norm": logits_norm_tracker}, open(os.path.join(args.save_model, 'logits_norm.json'), 'w'))
             
-            # Save the model (unwrap DDP if necessary)
-            model_to_save = get_model(model)
-            model_to_save.save_pretrained(os.path.join(args.save_model, f'checkpoint_{epoch}'))
+            if epoch % 1 == 0:
+                # Save the model (unwrap DDP if necessary)
+                model_to_save = get_model(model)
+                model_to_save.save_pretrained(os.path.join(args.save_model, f'checkpoint_{epoch}'))
 
+        # if rank == 0:
+        #     cleanup_distributed()
+        #     return
     # Clean up distributed training
     cleanup_distributed()
 
 
-def get_logits_norm(model, loader, device, ctx, position_ids, rank=0):
+def get_logits_norm(model, loader, device, ctx, rank=0):
     model.eval()
     with torch.no_grad():
         _norm = 0
-        for batch in tqdm.tqdm(loader, disable=(rank != 0)):
+        for batch in loader:
             input_ids = batch['input_ids_all'].to(device)
             labels = batch['labels_all'].to(device)
             with ctx:
-                outputs = get_model(model).compute_loss(input_ids=input_ids, labels=labels, position_ids=position_ids)
+                outputs = get_model(model).compute_loss(input_ids=input_ids, labels=labels)
                 _norm += outputs.logits.norm(dim=-1).sum().item()
     model.train()
     return _norm

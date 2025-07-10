@@ -194,7 +194,16 @@ def load_experiment_config(rpath: str):
             self.max_size = config_data.get('max_size', -1)
             self.remove_cot = config_data.get('remove_cot', False)
             self.random_cot = config_data.get('random_cot', False)
-            
+            self.enable_seq_vcr = config_data.get('enable_seq_vcr', False)
+            self.enable_pause_tokens = config_data.get('enable_pause_tokens', False)
+            self.lambda_var = config_data.get('lambda_var', 1.0)
+            self.lambda_cov = config_data.get('lambda_cov', 0.004)
+            self.num_pause_tokens = config_data.get('num_pause_tokens', 2)
+            self.projection_dim = config_data.get('projection_dim', 2048)
+            self.seq_vcr_epsilon = config_data.get('seq_vcr_epsilon', 1e-6)
+            self.use_temperature_scaling = config_data.get('use_temperature_scaling', False)
+            self.temperature_init_value = config_data.get('temperature_init_value', 1.0)
+            self.temperature_learnable = config_data.get('temperature_learnable', False)
             # Set up tokenizer
             self.tokenizer = AutoTokenizer.from_pretrained(self.model_name)
             if self.tokenizer.pad_token is None:
