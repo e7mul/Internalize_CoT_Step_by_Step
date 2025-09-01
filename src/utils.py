@@ -8,6 +8,45 @@ import numpy as np
 import random
 
 
+def setup_environment(args):
+    # Setup distributed training
+    rank, world_size, local_rank = setup_distributed()
+    
+    # Automatically enable distributed training if world_size > 1
+    if world_size > 1:
+        args.distributed = True
+        if rank == 0:
+            print(f"Automatically enabling distributed training (world_size={world_size})")
+    
+    # Only print from main process
+    if rank == 0:
+        print(args)
+    
+    # Set device based on local rank for distributed training
+    if args.distributed and torch.cuda.is_available():
+        device = torch.device(f'cuda:{local_rank}')
+        torch.cuda.set_device(device)
+    else:
+        device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+    
+    # Set seeds for reproducibility
+    random.seed(args.seed + rank)
+    torch.manual_seed(args.seed + rank)
+    if torch.cuda.is_available():
+        torch.cuda.manual_seed(args.seed + rank)
+
+    dtype = 'float32'
+    if args.bf16:
+        dtype = 'bfloat16'
+    ptdtype = {'float32': torch.float32, 'bfloat16': torch.bfloat16, 'float16': torch.float16}[dtype]
+    ctx = torch.amp.autocast(device_type='cuda', dtype=ptdtype)
+    
+    if rank == 0:
+        print(ptdtype, dtype, device)
+
+    return rank, world_size, device, ptdtype, ctx
+
+
 # Stop generation only after generating two EOSs, such as  z <eos> y <eos>
 class DoubleEOSStoppingCriteria(StoppingCriteria):
     def __init__(self, eos_token_id):
@@ -196,11 +235,6 @@ def cleanup_distributed():
     """Clean up distributed training"""
     if dist.is_initialized():
         dist.destroy_process_group()
-
-
-def get_model(model):
-    """Get the underlying model from DDP wrapper if wrapped"""
-    return model.module if hasattr(model, "module") else model
 
 
 def reduce_tensor(tensor, world_size):

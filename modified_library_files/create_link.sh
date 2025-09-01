@@ -1,0 +1,1 @@
+sudo ln -s /home/wmasarczyk/project/modified_library_files/modelling_gpt2.py /usr/local/lib/python3.10/dist-packages/transformers/models/gpt2/modeling_gpt2.py

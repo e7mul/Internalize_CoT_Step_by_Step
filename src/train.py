@@ -8,15 +8,14 @@ import torch
 import torch.distributed as dist
 import tqdm
 
-from model import save_model_and_optimizer, create_model
+from model import save_model_and_optimizer, create_model, get_model
+from data import get_dataloader
 from utils import (
     setup_environment,
     save_metrics,
     MetricTracker,
     cleanup_distributed,
     get_sep_position,
-    setup_distributed,
-    get_model,
 )
 
 
@@ -101,11 +100,18 @@ def get_logits_norm(model, loader, device, ctx, rank=0):
 
 def single_train_loop(model, optimizer, train_loader, device, ctx, args, rank, step):
     _norm = 0
+    avg_token_accuracy = 0
+    avg_ppl = 0
     for batch in train_loader:
         input_ids = batch["input_ids_all"].to(device)
         labels = batch["labels_all"].to(device)
         with ctx:  # this is the main part of the training loop
             outputs = get_model(model).compute_loss(input_ids=input_ids, labels=labels)
+
+            if rank == 0:
+                print("input_ids: ", model.tokenizer.decode(input_ids[0], skip_special_tokens=False))
+                print("outputs: ", model.tokenizer.decode(outputs.logits[0].argmax(dim=-1), skip_special_tokens=False))
+                exit()
             if rank == 0:
                 _norm += outputs.logits.norm(dim=-1).sum().item()
         loss = outputs.loss
@@ -115,29 +121,37 @@ def single_train_loop(model, optimizer, train_loader, device, ctx, args, rank, s
             optimizer.step()
             optimizer.zero_grad(set_to_none=True)
 
-        if step % 100 == 0 and rank == 0:
-            token_accuracy = outputs.token_accuracy.item()
-            ppl = loss.exp().item()
+        token_accuracy = outputs.token_accuracy.item()
+        ppl = loss.exp().item()
+        avg_token_accuracy += token_accuracy
+        avg_ppl += ppl
 
-            # reg_info = ""
+        if step % 100 == 0 and rank == 0:
+            # save_model_and_optimizer(model, optimizer, args, rank, step)
+
+            reg_info = ""
             # if hasattr(get_model(model), "get_regularization_info"):
             #     reg_data = get_model(model).get_regularization_info()
             #     if reg_data["enabled"]:
             #         reg_info = f" Reg Loss: {reg_data['last_loss']:.4f}"
 
             # Add temperature information
+            
             temp_info = ""
-            if args.use_temperature_scaling:
+            try:
                 temp_data = get_model(model).get_temperature_info()
                 if temp_data:
                     mean_temps = [layer["mean_temp"] for layer in temp_data]
                     avg_temp = sum(mean_temps) / len(mean_temps)
                     temp_info = f" Avg Temp: {avg_temp:.3f}"
+            except:
+                temp_info = ""
 
             print(
                 f"Step: {step}. PPL: {ppl}. Token Accuracy: {token_accuracy}{reg_info}{temp_info}"
             )
         step += 1
+    return _norm, avg_token_accuracy / step, avg_ppl / step, step
 
 
 def train(
@@ -176,7 +190,7 @@ def train(
             print(f"Epoch {epoch}.")
         model.train()
 
-        _norm = single_train_loop(
+        _norm, token_accuracy, ppl, step = single_train_loop(
             model, optimizer, train_dataloader, device, ctx, args, rank, step
         )
 
@@ -289,11 +303,6 @@ def main():
 
     # Temperature scaling arguments
     parser.add_argument(
-        "--use_temperature_scaling",
-        action="store_true",
-        help="Use temperature-scaled attention",
-    )
-    parser.add_argument(
         "--temperature_init_value",
         type=float,
         default=1.0,
@@ -310,7 +319,6 @@ def main():
         default=0.0,
         help="Rest value for temperature parameters (default: 0.0)",
     )
-    parser.set_defaults(use_temperature_scaling=False)
     parser.set_defaults(temperature_learnable=False)
 
     parser.add_argument(
@@ -325,9 +333,6 @@ def main():
     os.makedirs(args.save_config, exist_ok=True)
     json.dump(args.__dict__, open(os.path.join(args.save_config, "args.json"), "w"))
 
-    if rank == 0:
-        print(args)
-
     rank, world_size, device, ptdtype, ctx = setup_environment(args)
 
     if rank == 0:
@@ -337,18 +342,22 @@ def main():
 
     model, tokenizer = create_model(args, device, ptdtype, rank)
 
-    train_loader = get_dataloader(args, args.train_path, tokenizer, world_size, rank)
-    val_loader = get_dataloader(args, args.val_path, tokenizer, world_size, rank)
-    test_loader = get_dataloader(args, args.test_path, tokenizer, world_size, rank)
+    train_loader, train_sampler = get_dataloader(args, args.train_path, tokenizer, world_size, rank)
+    val_loader, _ = get_dataloader(args, args.val_path, tokenizer, world_size, rank)
+    if args.test_path:
+        test_loader, _ = get_dataloader(args, args.test_path, tokenizer, world_size, rank)
+    else:
+        test_loader = None
 
     optimizer = create_optimizer(args, model)
-    save_model_and_optimizer(model, optimizer, args, rank, -1)
+    # save_model_and_optimizer(model, optimizer, args, rank, -1)
+
     train(
         model,
         optimizer,
-        train_dataloader,
-        val_dataloader,
-        test_dataloader,
+        train_loader,
+        val_loader,
+        test_loader,
         tokenizer,
         device,
         ctx,

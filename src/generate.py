@@ -18,21 +18,24 @@ def split_samples(input_ids, eos_token_id):
     sep_positions = sep_positions.nonzero()
     diffs = [sep_positions[0] + 1] + list(sep_positions[1:] - sep_positions[:-1])
     diffs = [x.item() for x in diffs]
-    inputs, cots, outputs = torch.split(input_ids, diffs, dim=1)
+    try:
+        inputs, cots, outputs = torch.split(input_ids, diffs, dim=1)
+    except ValueError:
+        print("No CoT")
+        inputs, outputs = torch.split(input_ids, diffs, dim=1)
+        cots = None
     return inputs, cots, outputs
-    
-    
+
 
 @torch.no_grad()
-def evaluate(dataloader, tokenizer, device, model, max_new_tokens):
+def evaluate_gen(dataloader, tokenizer, device, model, max_new_tokens):
     model.eval()
     total_samples = 0
     correct_at_id = {}
     for batch in dataloader:
         input_ids_all = batch['input_ids_all']
-        # Remove answer part
-        input_ids, cot_ids, targets_ids = split_samples(input_ids_all, tokenizer.eos_token_id)
 
+        input_ids, cot_ids, targets_ids = split_samples(input_ids_all, tokenizer.eos_token_id)
         input_ids = input_ids.to(device)
         targets_ids = targets_ids.to(device)
     
@@ -68,23 +71,7 @@ def evaluate(dataloader, tokenizer, device, model, max_new_tokens):
             for e, (a, t) in enumerate(zip(trimmed_answer, trimmed_target)):
                 correct_at_id[e] = correct_at_id.get(e, 0) + (a == t)
 
-
-
-        # # if max_new_tokens == targets_ids.shape[1]: # case for no CoT models
-        # #     trimmed_answers = beam_output[:, input_ids.shape[1] + 3 : -1] # remove the input and initial <eos> tokens 
-        # # else:
-        # #     penultimate_eos_token = (beam_output[0] == tokenizer.eos_token_id).nonzero()[-2]
-        # #     trimmed_answers = beam_output[:, penultimate_eos_token:]
-
-        # trimmed_answers = beam_output[:, input_ids.shape[1] + 2 : -2] # remove the input and initial <eos> tokens 
-        # trimmed_targets = targets_ids[:, 2:-2] # remove the initial special tokens and the final <eos> token
-
-
-        # correct_per_index = torch.sum(trimmed_targets == trimmed_answers, dim=0)
-        # for index, correct in enumerate(correct_per_index):
-            # correct_at_id[index] = correct_at_id.get(index, 0) + correct.item()
         total_samples += input_ids.shape[0]
-
     return correct_at_id, total_samples
 
 
@@ -122,7 +109,7 @@ def plot_accuracy(correct_at_id, total_samples, rpath):
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument('--rpath', type=str, default=None)
-    parser.add_argument('--test_path', type=str, required=True)
+    parser.add_argument('--test_path', type=str, required=False, default="data/5_by_5_mult/valid.txt")
     parser.add_argument('--max_new_tokens', type=int, default=14)
     parser.add_argument('--batch_size', type=int, default=64)
     parser.add_argument('--truncation', type=int, default=-1)
@@ -136,9 +123,12 @@ def main():
 
     if args.bf16:
         dtype = 'bfloat16'
+        ptdtype = torch.bfloat16
     else:
         dtype = 'float32'
+        ptdtype = torch.float32
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+    ctx = torch.amp.autocast(device_type='cuda', dtype=ptdtype)
     print (dtype, device)
 
     # Load model
@@ -148,12 +138,16 @@ def main():
     model.eval()
     tokenizer = model.tokenizer
 
+
     # Load data
     collate_fn = CoTDataCollator(tokenizer)
     test_dataset = CoTDataset(tokenizer, args.test_path, args.truncation, keep_k_target=args.keep_k_target)
     test_dataloader = DataLoader(test_dataset, batch_size=args.batch_size, collate_fn=collate_fn, shuffle=False)
 
-    correct_at_id, total_samples = evaluate(test_dataloader, tokenizer, device, model, args.max_new_tokens)
+    # accuracy, token_accuracy, ppl, ans_accuracy = evaluate(test_dataloader, tokenizer, device, ctx, model)
+    # print(f"Accuracy: {accuracy}, Token Accuracy: {token_accuracy}, PPL: {ppl}, Ans Accuracy: {ans_accuracy}")
+    # exit()
+    correct_at_id, total_samples = evaluate_gen(test_dataloader, tokenizer, device, model, args.max_new_tokens)
     plot_accuracy(correct_at_id, total_samples, args.rpath)
 
 if __name__ == "__main__":

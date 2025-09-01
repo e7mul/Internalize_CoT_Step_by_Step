@@ -11,10 +11,8 @@ export SAVE=results/${D}_by_${D}_mult/gpt2_${DATE}
 export SAVE_CKPTS=results/${D}_by_${D}_mult/gpt2_${DATE}/checkpoints
 mkdir -p $SAVE
 
-CUDA_VISIBLE_DEVICES=0,1,4,5,6,7 \
-torchrun --nproc_per_node=6 --master_addr=localhost --master_port=29500 src/train.py \
+python3 src/train.py \
     --model ${MODEL} \
-    --distributed \
     --bf16 \
     --train_path ${FOLDER}/train.txt \
     --val_path ${FOLDER}/valid.txt \
@@ -31,4 +29,4 @@ torchrun --nproc_per_node=6 --master_addr=localhost --master_port=29500 src/trai
     --save_config ${SAVE} \
     --temperature_init_value 1e-3 \
     --temperature_learnable \
-    > ${SAVE}/log.train 2>&1
+    > ${SAVE}/log.train 

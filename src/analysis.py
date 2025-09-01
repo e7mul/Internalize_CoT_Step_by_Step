@@ -147,7 +147,8 @@ if __name__ == "__main__":
     
     print(list(attn_maps.keys()))
     results = {}
-    for epoch in [-1] + args.epochs.split(","):
+    # for epoch in [-1] + args.epochs.split(","):
+    for epoch in args.epochs.split(","):
         analysis = Analysis(attn_maps[int(epoch)])
         results[f"epoch_{epoch}"] = analysis.analyze()
 

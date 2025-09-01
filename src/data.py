@@ -2,7 +2,7 @@ from dataclasses import dataclass
 import os
 import copy
 import torch
-from torch.utils.data import Dataset
+from torch.utils.data import Dataset, DataLoader, DistributedSampler
 from torch.nn.utils.rnn import pad_sequence
 
 
@@ -33,7 +33,7 @@ def get_dataloader(args, path, tokenizer, world_size, rank):
         sampler=sampler,
         shuffle=(sampler is None),
     )
-    return loader
+    return loader, sampler
 
 
 def extract_answer(text):
@@ -69,7 +69,6 @@ class CoTDataset(Dataset):
         keep_k_target=0,
     ):
         assert os.path.isfile(file_path), f"Input file path {file_path} not found"
-        print(f"Creating features from dataset file at {file_path}")
         eos_tok = tokenizer.eos_token
 
         with open(file_path, encoding="utf-8") as f:

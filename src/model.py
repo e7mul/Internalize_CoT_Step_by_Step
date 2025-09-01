@@ -14,6 +14,10 @@ from transformers import (
 from configuration_model import ImplicitModelConfig
 from utils import DoubleEOSStoppingCriteria, DoubleEOSLogitsProcessor
 
+def get_model(model):
+    """Get the underlying model from DDP wrapper if wrapped"""
+    return model.module if hasattr(model, "module") else model
+
 
 def save_model_and_optimizer(model, optimizer, args, rank, ckpt_idx):
     if rank == 0:
@@ -32,12 +36,11 @@ def save_model_and_optimizer(model, optimizer, args, rank, ckpt_idx):
         print(f"Saved model and optimizer to {args.save_model}/checkpoint_{ckpt_idx}")
 
 
-def get_model(args, device, ptdtype, rank):
+def create_model(args, device, ptdtype, rank):
     # Create model with temperature scaling options
     if args.from_pretrained is None:
         config = ImplicitModelConfig(
             base_model=args.model,
-            use_temperature_scaling=args.use_temperature_scaling,
             temperature_init_value=args.temperature_init_value,
             temperature_learnable=args.temperature_learnable,
         )
@@ -46,7 +49,6 @@ def get_model(args, device, ptdtype, rank):
         if rank == 0:
             print(f"Loading from {args.from_pretrained}")
         override_config = {
-            "use_temperature_scaling": args.use_temperature_scaling,
             "temperature_init_value": args.temperature_init_value,
             "temperature_learnable": args.temperature_learnable,
         }
@@ -60,6 +62,12 @@ def get_model(args, device, ptdtype, rank):
 
     model = model.to(device).to(ptdtype)
     tokenizer = model.tokenizer
+    
+    if rank == 0:
+        for name, module in model.named_modules():
+            if hasattr(module, "temperature_logits"):
+                print(f"{name} has temperature_logits")
+                print(module.temperature_logits)
 
     if args.reinitialize_weights:
         if rank == 0:
@@ -75,20 +83,20 @@ class ImplicitModel(nn.Module):
         super().__init__()
         self.config = config
 
-        # Choose between standard and temperature-scaled model
-        if config.use_temperature_scaling:
-            from custom_gpt2 import TemperatureScaledGPT2LMHeadModel
-
-            self.base_model = TemperatureScaledGPT2LMHeadModel.from_pretrained(
-                config.base_model,
-                temperature_init_value=config.temperature_init_value,
-                temperature_learnable=config.temperature_learnable,
-                trust_remote_code=True,
-            )
-        else:
-            self.base_model = AutoModelForCausalLM.from_pretrained(
-                config.base_model, trust_remote_code=True
-            )
+        # Load the base model config first
+        from transformers import AutoConfig
+        base_config = AutoConfig.from_pretrained(config.base_model, trust_remote_code=True)
+        
+        # Add temperature parameters to the base model config
+        base_config.temperature_init_value = config.temperature_init_value
+        base_config.temperature_learnable = config.temperature_learnable
+        
+        # Create the model with the modified config
+        self.base_model = AutoModelForCausalLM.from_pretrained(
+            config.base_model, 
+            config=base_config,
+            trust_remote_code=True
+        )    
 
         if reinitialize_weights:
             print("Reinitializing model weights!")
@@ -136,6 +144,7 @@ class ImplicitModel(nn.Module):
         ans_preds = logits[..., sep_position:-1, :].argmax(-1)
         ans_labels = labels[..., sep_position + 1 :]
         correct_ans_tokens = (ans_preds == ans_labels).sum()
+
         total_ans_tokens = (ans_labels != -100).sum()
         correct_per_row = (ans_preds == ans_labels).sum(-1)
         total_correct_answers = (correct_per_row == ans_labels.shape[-1]).sum()
@@ -190,7 +199,9 @@ class ImplicitModel(nn.Module):
             num_return_sequences=1,
             logits_processor=logits_processor,
             stopping_criteria=stopping_criteria,
-            do_sample=True,
+            do_sample=False,
+            temperature=1.0,
+            use_cache=False,
         )
         return beam_output
 
@@ -225,12 +236,12 @@ class ImplicitModel(nn.Module):
             else:
                 raise e
 
-        if override_config is not None and override_config["use_temperature_scaling"]:
+        if override_config is not None:
             for name, module in model.named_modules():
                 if hasattr(module, "temperature_logits"):
                     module.temperature_logits.data = torch.full(
                         (module.num_heads,),
-                        math.log(override_config["temperature_init_value"]),
+                        override_config["temperature_init_value"],
                         dtype=torch.float32,
                     )
 
