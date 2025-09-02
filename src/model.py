@@ -136,15 +136,20 @@ class ImplicitModel(nn.Module):
                     results.append(-1)
             return torch.tensor(results)
 
-        sep_positions = get_last_sep_position(input_ids)
+        sep_positions = get_last_sep_position(input_ids) # second-to-last EoS token per each sample
         assert (
             len(sep_positions.unique()) == 1
         ), "sep_positions has more than one unique value"
+        # the assert above makes sure that the second-to-last EoS token is the same for all samples
         sep_position = sep_positions[0]
-        ans_preds = logits[..., sep_position:-1, :].argmax(-1)
-        ans_labels = labels[..., sep_position + 1 :]
+        # logits: [batch_size, seq_len, vocab_size]
+        # labels: [batch_size, seq_len]
+        # sep_position: [batch_size]
+        ans_preds = logits[..., sep_position:-1, :].argmax(-1) # the last input token is <|endoftext|> thus, we don't care what models predicts for it
+        ans_labels = labels[..., sep_position + 1 :] # here we add +1 as labels[..., sep_position] is the second-to-last EoS token
         correct_ans_tokens = (ans_preds == ans_labels).sum()
 
+        # the code below computes how many fully correct answers are there in the batch
         total_ans_tokens = (ans_labels != -100).sum()
         correct_per_row = (ans_preds == ans_labels).sum(-1)
         total_correct_answers = (correct_per_row == ans_labels.shape[-1]).sum()
@@ -155,6 +160,8 @@ class ImplicitModel(nn.Module):
         total_tokens = mask.sum()
         token_accuracy = correct_tokens / total_tokens
 
+        # when comparing labels with predictions we skip the first label as it is already sent as the input to the model
+        # and we don't care about the last prediction of the model as it predict the next token after <|endoftext|>
         shift_logits = logits[..., :-1, :].contiguous()
         shift_labels = labels[..., 1:].contiguous()
         loss_fct = CrossEntropyLoss()
