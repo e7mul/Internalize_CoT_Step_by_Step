@@ -121,6 +121,9 @@ def eager_attention_forward(module, query, key, value, attention_mask, head_mask
     if module.scale_attn_by_inverse_layer_idx:
         attn_weights = attn_weights / float(module.layer_idx + 1)
 
+    # Apply temperature scaling
+    attn_weights = attn_weights * module.temperature_logits.view(1, module.num_heads, 1, 1)
+
     if not module.is_cross_attention:
         # if only "normal" attention layer implements causal mask
         query_length, key_length = query.size(-2), key.size(-2)
@@ -136,8 +139,6 @@ def eager_attention_forward(module, query, key, value, attention_mask, head_mask
         causal_mask = attention_mask[:, :, :, : key.shape[-2]]
         attn_weights = attn_weights + causal_mask
 
-    # Apply temperature scaling
-    attn_weights = attn_weights * module.temperature_logits.view(1, module.num_heads, 1, 1)
 
     attn_weights = nn.functional.softmax(attn_weights, dim=-1)
 

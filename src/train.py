@@ -107,11 +107,6 @@ def single_train_loop(model, optimizer, train_loader, device, ctx, args, rank, s
         labels = batch["labels_all"].to(device)
         with ctx:  # this is the main part of the training loop
             outputs = get_model(model).compute_loss(input_ids=input_ids, labels=labels)
-
-            if rank == 0:
-                print("input_ids: ", model.tokenizer.decode(input_ids[0], skip_special_tokens=False))
-                print("outputs: ", model.tokenizer.decode(outputs.logits[0].argmax(dim=-1), skip_special_tokens=False))
-                exit()
             if rank == 0:
                 _norm += outputs.logits.norm(dim=-1).sum().item()
         loss = outputs.loss
