@@ -64,10 +64,10 @@ def create_model(args, device, ptdtype, rank):
     tokenizer = model.tokenizer
     
     if rank == 0:
-        for name, module in model.named_modules():
-            if hasattr(module, "temperature_logits"):
-                print(f"{name} has temperature_logits")
-                print(module.temperature_logits)
+        temp_data = model.get_all_temperature_info()
+        for layer in temp_data:
+            print(f"Layer{layer['layer']} has temperature_logits")
+            print(layer['temps'])
 
     if args.reinitialize_weights:
         if rank == 0:
@@ -212,19 +212,24 @@ class ImplicitModel(nn.Module):
         )
         return beam_output
 
-    def get_temperature_info(self):
-        """Get temperature information if using temperature scaling."""
-        if hasattr(self.base_model, "get_all_temperature_info"):
-            return self.base_model.get_all_temperature_info()
-        else:
-            return None
+    def get_all_temperature_info(self):
+        """Get temperature information from all attention layers."""
+        temp_info = []
+        for i, block in enumerate(self.base_model.transformer.h):
+            if hasattr(block.attn, 'get_temperature_logits'):
+                temps = block.attn.get_temperature_logits().detach().cpu().to(torch.float32).numpy()
+                temp_info.append({
+                    'layer': i,
+                    'mean_temp': float(temps.mean()),
+                    'temps': temps.tolist()
+                })
+        return temp_info
 
-    def set_temperature_learning(self, learnable):
+    def set_all_temperature_learning(self, learnable):
         """Enable/disable temperature learning."""
-        if hasattr(self.base_model, "set_temperature_learning"):
-            self.base_model.set_temperature_learning(learnable)
-        else:
-            print("Temperature scaling not enabled for this model")
+        for i, block in enumerate(self.base_model.transformer.h):
+            if hasattr(block.attn, 'temperature_logits'):
+                block.attn.temperature_logits.requires_grad = learnable
 
     @classmethod
     def from_pretrained(cls, pretrained_path, override_config=None):

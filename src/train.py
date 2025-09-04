@@ -133,14 +133,14 @@ def single_train_loop(model, optimizer, train_loader, device, ctx, args, rank, s
             # Add temperature information
             
             temp_info = ""
-            try:
-                temp_data = get_model(model).get_temperature_info()
-                if temp_data:
-                    mean_temps = [layer["mean_temp"] for layer in temp_data]
-                    avg_temp = sum(mean_temps) / len(mean_temps)
-                    temp_info = f" Avg Temp: {avg_temp:.3f}"
-            except:
-                temp_info = ""
+            # try:
+            temp_data = get_model(model).get_all_temperature_info()
+            if temp_data:
+                mean_temps = [layer["mean_temp"] for layer in temp_data]
+                avg_temp = sum(mean_temps) / len(mean_temps)
+                temp_info = f" Avg Temp: {avg_temp:.3f}"
+            # except:
+            #     temp_info = ""
 
             print(
                 f"Step: {step}. PPL: {ppl}. Token Accuracy: {token_accuracy}{reg_info}{temp_info}"
@@ -336,6 +336,19 @@ def main():
         )
 
     model, tokenizer = create_model(args, device, ptdtype, rank)
+    
+
+    # Add DDP wrapping for distributed training
+    if args.distributed and world_size > 1:
+        model = torch.nn.parallel.DistributedDataParallel(
+            model, 
+            device_ids=[device.index] if device.type == 'cuda' else None,
+            find_unused_parameters=False
+        )
+        if rank == 0:
+            print("Model wrapped with DistributedDataParallel")
+
+
 
     train_loader, train_sampler = get_dataloader(args, args.train_path, tokenizer, world_size, rank)
     val_loader, _ = get_dataloader(args, args.val_path, tokenizer, world_size, rank)
