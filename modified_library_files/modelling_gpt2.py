@@ -122,7 +122,7 @@ def eager_attention_forward(module, query, key, value, attention_mask, head_mask
         attn_weights = attn_weights / float(module.layer_idx + 1)
 
     # Apply temperature scaling
-    attn_weights = attn_weights * module.temperature_logits.view(1, module.num_heads, 1, 1)
+    attn_weights = attn_weights * torch.exp(module.temperature_logits.view(1, module.num_heads, 1, 1))
 
     if not module.is_cross_attention:
         # if only "normal" attention layer implements causal mask
@@ -188,11 +188,11 @@ class GPT2Attention(nn.Module):
         self.layer_idx = layer_idx
         self.reorder_and_upcast_attn = config.reorder_and_upcast_attn
 
-        self.temperature_init_value = config.temperature_init_value
+        self.temperature_init_value = torch.log(config.temperature_init_value)
         self.temperature_learnable = config.temperature_learnable
 
         if self.temperature_learnable:
-            self.temperature_logits = nn.Parameter(torch.full((self.num_heads,), self.temperature_init_value, dtype=torch.float32))
+            self.temperature_logits = nn.Parameter(torch.full((self.num_heads,), self.temperature_init_value), dtype=torch.float32)
         else:
             self.register_buffer(
                 'temperature_logits',
